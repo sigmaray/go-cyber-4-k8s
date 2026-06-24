@@ -1,0 +1,174 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+          cache-dependency-path: go.sum
+
+      - name: Download Go modules
+        run: go mod download
+
+      - name: Build
+        run: go build -o /dev/null ./cmd/server
+
+      - name: Start services
+        run: docker compose up -d --build --wait
+
+      - name: Wait for app health
+        run: |
+          for i in $(seq 1 30); do
+            if curl -sf http://localhost:8080/health; then
+              echo "App is healthy"
+              exit 0
+            fi
+            echo "Waiting for app ($i/30)..."
+            sleep 2
+          done
+          echo "App failed to become healthy"
+          docker compose logs
+          exit 1
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+
+      - name: Install Cypress
+        run: npm ci
+
+      - name: Run Cypress tests
+        run: npm run cypress:run
+        env:
+          CYPRESS_BASE_URL: http://localhost:8080
+
+      - name: Stop services
+        if: always()
+        run: docker compose down -v
+
+  deploy-kubernetes:
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+
+      - name: Create kind cluster
+        uses: helm/kind-action@v1
+        with:
+          cluster_name: tasks-cluster
+
+      - name: Build Docker image
+        run: docker build -t tasks-app:latest .
+
+      - name: Load image into kind
+        run: kind load docker-image tasks-app:latest --name tasks-cluster
+
+      - name: Deploy to Kubernetes
+        run: |
+          kubectl apply -f k8s/namespace.yaml
+          kubectl apply -f k8s/postgres-secret.yaml
+          kubectl apply -f k8s/postgres-pvc.yaml
+          kubectl apply -f k8s/postgres-deployment.yaml
+          kubectl apply -f k8s/postgres-service.yaml
+          kubectl apply -f k8s/app-deployment.yaml
+          kubectl apply -f k8s/app-service.yaml
+
+      - name: Wait for PostgreSQL
+        run: |
+          kubectl wait --for=condition=available deployment/postgres \
+            -n tasks --timeout=180s
+
+      - name: Wait for app deployment
+        run: |
+          kubectl wait --for=condition=available deployment/tasks-app \
+            -n tasks --timeout=180s
+
+      - name: Verify 3 app replicas are running
+        run: |
+          READY=$(kubectl get deployment tasks-app -n tasks \
+            -o jsonpath='{.status.readyReplicas}')
+          echo "Ready replicas: $READY"
+          if [ "$READY" != "3" ]; then
+            kubectl get pods -n tasks
+            kubectl describe deployment tasks-app -n tasks
+            exit 1
+          fi
+
+      - name: Verify health endpoint via port-forward
+        run: |
+          kubectl port-forward -n tasks svc/tasks-app 8080:80 &
+          PF_PID=$!
+          sleep 3
+          for i in $(seq 1 30); do
+            if curl -sf http://localhost:8080/health; then
+              echo "Health check passed"
+              kill $PF_PID
+              exit 0
+            fi
+            echo "Waiting for health ($i/30)..."
+            sleep 2
+          done
+          kubectl logs -n tasks -l app=tasks-app --tail=50
+          kill $PF_PID || true
+          exit 1
+
+      - name: Verify CRUD via API
+        run: |
+          kubectl port-forward -n tasks svc/tasks-app 8080:80 &
+          PF_PID=$!
+          sleep 3
+
+          CREATE=$(curl -sf -X POST http://localhost:8080/api/tasks \
+            -H 'Content-Type: application/json' \
+            -d '{"title":"k8s task","description":"from ci"}')
+          echo "Created: $CREATE"
+          ID=$(echo "$CREATE" | python3 -c "import sys,json; print(json.load(sys.stdin)['id'])")
+
+          curl -sf http://localhost:8080/api/tasks | grep -q "k8s task"
+
+          curl -sf -X PUT "http://localhost:8080/api/tasks/$ID" \
+            -H 'Content-Type: application/json' \
+            -d '{"title":"k8s task updated","done":true}'
+
+          curl -sf http://localhost:8080/api/tasks | grep -q "k8s task updated"
+
+          curl -sf -X DELETE "http://localhost:8080/api/tasks/$ID"
+
+          kill $PF_PID
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+
+      - name: Install Cypress
+        run: npm ci
+
+      - name: Run Cypress against Kubernetes
+        run: |
+          kubectl port-forward -n tasks svc/tasks-app 8080:80 &
+          PF_PID=$!
+          sleep 3
+          npm run cypress:run
+          kill $PF_PID
+        env:
+          CYPRESS_BASE_URL: http://localhost:8080

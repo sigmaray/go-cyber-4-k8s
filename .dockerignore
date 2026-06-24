@@ -1,0 +1,8 @@
+node_modules/
+cypress/
+.git/
+.github/
+*.md
+package.json
+package-lock.json
+cypress.config.js

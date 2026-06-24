@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: tasks-app
+  namespace: tasks
+  labels:
+    app: tasks-app
+spec:
+  type: NodePort
+  selector:
+    app: tasks-app
+  ports:
+    - port: 80
+      targetPort: 8080
+      nodePort: 30080

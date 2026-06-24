@@ -1,0 +1,6 @@
+postgres/
+vendor/
+node_modules/
+cypress/videos/
+cypress/screenshots/
+*.log
